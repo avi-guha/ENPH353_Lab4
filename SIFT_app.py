@@ -57,8 +57,8 @@ class My_App(QtWidgets.QMainWindow):
     - `RANSAC_REPROJ_THRESH` is the RANSAC reprojection error threshold (in pixels).
     """
 
-    MIN_GOOD_MATCHES = 40            # Minimum "good" matches before attempting/accepting homography
-    RATIO_TEST = 0.70                # Lowe ratio test threshold (smaller = stricter, e.g., 0.6–0.75 typical)
+    MIN_GOOD_MATCHES = 20            # Minimum "good" matches before attempting/accepting homography
+    RATIO_TEST = 0.5                # Lowe ratio test threshold (smaller = stricter, e.g., 0.6–0.75 typical)
     RANSAC_REPROJ_THRESH = 5.0       # RANSAC reprojection threshold in pixels
 
     MATCH_W, MATCH_H = 900, 420      # Popup visualization canvas size
