@@ -12,14 +12,18 @@ import sys
 class My_App(QtWidgets.QMainWindow):
     """
     SIFT + BFMatcher + Homography (RANSAC).
-    - Non-modal popup shows: (1) good match count, (2) template thumbnail, (3) live webcam thumbnail.
-    - Homography polygon is drawn on the main live view when good matches >= 40.
+    - Main UI shows a clean live camera view (no overlays).
+    - Popup shows the side-by-side matches visualization with lines.
+      If >= MIN_GOOD_MATCHES, a blue homography polygon is drawn on the
+      *right (live) side* inside the popup image.
     """
 
     MIN_GOOD_MATCHES = 40
-    RATIO_TEST = 0.75
+    RATIO_TEST = 0.60                 # <- stricter ratio per request
     RANSAC_REPROJ_THRESH = 5.0
-    THUMB_W, THUMB_H = 220, 220  # popup thumbnail max size
+
+    MATCH_W, MATCH_H = 900, 420       # popup canvas size (scaled to fit)
+    CAM_W, CAM_H = 320, 240
 
     def __init__(self):
         super(My_App, self).__init__()
@@ -35,8 +39,8 @@ class My_App(QtWidgets.QMainWindow):
         self.toggle_cam_button.clicked.connect(self.SLOT_toggle_camera)
 
         self._camera_device = cv2.VideoCapture(self._cam_id)
-        self._camera_device.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-        self._camera_device.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+        self._camera_device.set(cv2.CAP_PROP_FRAME_WIDTH, self.CAM_W)
+        self._camera_device.set(cv2.CAP_PROP_FRAME_HEIGHT, self.CAM_H)
 
         # Timer
         self._timer = QtCore.QTimer(self)
@@ -60,7 +64,7 @@ class My_App(QtWidgets.QMainWindow):
     # ---------- Popup construction & helpers ----------
 
     def _build_match_popup(self):
-        """Small always-on-top tool window with match count + two thumbnails."""
+        """Always-on-top window with match count and match-visualization canvas."""
         self.match_dialog = QtWidgets.QDialog(self)
         self.match_dialog.setWindowTitle("SIFT Matches")
         self.match_dialog.setWindowFlags(
@@ -75,21 +79,18 @@ class My_App(QtWidgets.QMainWindow):
         # Count label
         self.match_label = QtWidgets.QLabel("Good matches: 0 (need 40+)")
         self.match_label.setAlignment(QtCore.Qt.AlignCenter)
-        f = self.match_label.font(); f.setPointSize(12); f.setBold(True)
+        f = self.match_label.font()
+        f.setPointSize(12)
+        f.setBold(True)
         self.match_label.setFont(f)
         outer.addWidget(self.match_label)
 
-        # Thumbnails row
-        thumbs = QtWidgets.QHBoxLayout()
-        self.tmpl_thumb = QtWidgets.QLabel("Template")
-        self.live_thumb = QtWidgets.QLabel("Live")
-        for lab in (self.tmpl_thumb, self.live_thumb):
-            lab.setAlignment(QtCore.Qt.AlignCenter)
-            lab.setFixedSize(self.THUMB_W, self.THUMB_H)
-            lab.setStyleSheet("border:1px solid #888; background:#111; color:#ccc;")
-        thumbs.addWidget(self.tmpl_thumb)
-        thumbs.addWidget(self.live_thumb)
-        outer.addLayout(thumbs)
+        # Single canvas that will show cv2.drawMatches output
+        self.matches_view = QtWidgets.QLabel()
+        self.matches_view.setAlignment(QtCore.Qt.AlignCenter)
+        self.matches_view.setFixedSize(self.MATCH_W, self.MATCH_H)
+        self.matches_view.setStyleSheet("border:1px solid #888; background:#111; color:#ccc;")
+        outer.addWidget(self.matches_view)
 
         self.match_dialog.hide()
 
@@ -101,24 +102,14 @@ class My_App(QtWidgets.QMainWindow):
         pm = QtGui.QPixmap.fromImage(qimg)
         return pm.scaled(max_w, max_h, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
 
-    def _update_match_popup(self, frame_bgr, good_count):
-        # Update count text
+    def _update_match_popup(self, vis_bgr, good_count):
+        """Update count text and visualization image in the popup."""
         self.match_label.setText(
             f"Good matches: {good_count} "
             f"({'OK' if good_count >= self.MIN_GOOD_MATCHES else 'need 40+'})"
         )
-
-        # Template thumb
-        if self.template_img_color is not None:
-            self.tmpl_thumb.setPixmap(
-                self._bgr_to_pixmap_scaled(self.template_img_color, self.THUMB_W, self.THUMB_H)
-            )
-
-        # Live thumb (current webcam frame)
-        if frame_bgr is not None:
-            self.live_thumb.setPixmap(
-                self._bgr_to_pixmap_scaled(frame_bgr, self.THUMB_W, self.THUMB_H)
-            )
+        if vis_bgr is not None:
+            self.matches_view.setPixmap(self._bgr_to_pixmap_scaled(vis_bgr, self.MATCH_W, self.MATCH_H))
 
     # ---------- UI helpers ----------
 
@@ -137,7 +128,7 @@ class My_App(QtWidgets.QMainWindow):
             return
         self.template_path = dlg.selectedFiles()[0]
 
-        # Show template in main UI
+        # Show template in the main UI (no overlays)
         self.template_label.setPixmap(QtGui.QPixmap(self.template_path))
 
         # Load template for OpenCV
@@ -157,59 +148,66 @@ class My_App(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Template", "No SIFT features found in the template image.")
         else:
             QtWidgets.QMessageBox.information(self, "Template", "Template loaded and features computed.")
-            # Prime the popup template thumbnail
-            self._update_match_popup(None, 0)
+            # Clear popup canvas
+            blank = np.zeros((self.CAM_H, self.CAM_W + (self.template_img_color.shape[1] if self.template_img_color is not None else self.CAM_W), 3), dtype=np.uint8)
+            self._update_match_popup(blank, 0)
 
     def SLOT_query_camera(self):
         ok, frame = self._camera_device.read()
         if not ok:
             return
 
-        display_frame = frame.copy()
+        # --- MAIN UI: show clean live feed (no lines / no boxes) ---
+        self.live_image_label.setPixmap(self.convert_cv_to_pixmap(frame))
+
+        # --- POPUP: compute matches and draw only there ---
+        if not self._is_template_loaded:
+            return
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        kp_frame, desc_frame = self.sift.detectAndCompute(gray, None)
+
         good_matches = []
+        vis_bgr = None
 
-        if self._is_template_loaded:
-            # Detect features in live frame
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            kp_frame, desc_frame = self.sift.detectAndCompute(gray, None)
+        if desc_frame is not None and len(desc_frame) > 0:
+            raw_matches = self.bf.knnMatch(self.template_desc, desc_frame, k=2)
 
-            if desc_frame is not None and len(desc_frame) > 0:
-                # KNN match
-                raw = self.bf.knnMatch(self.template_desc, desc_frame, k=2)
+            # Lowe ratio test at 0.60
+            for m, n in raw_matches:
+                if m.distance < self.RATIO_TEST * n.distance:
+                    good_matches.append(m)
 
-                # Lowe ratio test
-                for m, n in raw:
-                    if m.distance < self.RATIO_TEST * n.distance:
-                        good_matches.append(m)
+            # Optionally draw homography on a copy of the live frame BEFORE drawMatches
+            overlay_frame = frame.copy()
+            if len(good_matches) >= self.MIN_GOOD_MATCHES:
+                src_pts = np.float32([self.template_kp[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                dst_pts = np.float32([kp_frame[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, self.RANSAC_REPROJ_THRESH)
+                if H is not None:
+                    h, w = self.template_img_gray.shape
+                    corners = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
+                    proj = cv2.perspectiveTransform(corners, H)
+                    cv2.polylines(overlay_frame, [np.int32(proj)], True, (255, 0, 0), 3, cv2.LINE_AA)
 
-                # Update the popup thumbnails + count
-                self._update_match_popup(frame, len(good_matches))
+            # Build the side-by-side visualization WITH lines (and polygon if added)
+            vis_bgr = cv2.drawMatches(
+                self.template_img_color, self.template_kp,
+                overlay_frame, kp_frame if kp_frame is not None else [],
+                good_matches, None,
+                flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+            )
 
-                # Draw on main view
-                if len(good_matches) >= self.MIN_GOOD_MATCHES:
-                    src_pts = np.float32([self.template_kp[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                    dst_pts = np.float32([kp_frame[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                    H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, self.RANSAC_REPROJ_THRESH)
-                    if H is not None:
-                        h, w = self.template_img_gray.shape
-                        corners = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
-                        proj = cv2.perspectiveTransform(corners, H)
-                        display_frame = cv2.polylines(display_frame, [np.int32(proj)],
-                                                      True, (255, 0, 0), 3, cv2.LINE_AA)
-                        cv2.putText(display_frame, f"Homography (good={len(good_matches)})",
-                                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2, cv2.LINE_AA)
-                    else:
-                        display_frame = self._draw_matches(self.template_img_color, self.template_kp,
-                                                           frame, kp_frame, good_matches)
-                else:
-                    display_frame = self._draw_matches(self.template_img_color, self.template_kp,
-                                                       frame, kp_frame, good_matches)
-            else:
-                # No descriptors found in the live frame
-                self._update_match_popup(frame, 0)
+            # Add a small caption at the top of the composite
+            cv2.putText(vis_bgr, f"Good matches: {len(good_matches)} (need 40+ for Homography)",
+                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 0), 2, cv2.LINE_AA)
 
-        # Push to the main UI
-        self.live_image_label.setPixmap(self.convert_cv_to_pixmap(display_frame))
+        # Push visualization to popup (or clear if none)
+        if vis_bgr is None:
+            blank = np.zeros((self.CAM_H, self.CAM_W + (self.template_img_color.shape[1] if self.template_img_color is not None else self.CAM_W), 3), dtype=np.uint8)
+            self._update_match_popup(blank, 0)
+        else:
+            self._update_match_popup(vis_bgr, len(good_matches))
 
     def SLOT_toggle_camera(self):
         if self._is_cam_enabled:
@@ -222,19 +220,6 @@ class My_App(QtWidgets.QMainWindow):
             self._is_cam_enabled = True
             self.toggle_cam_button.setText("&Disable camera")
             self.match_dialog.show()
-
-    # ---------- Drawing helpers ----------
-
-    def _draw_matches(self, tmpl_bgr, tmpl_kp, frame_bgr, frame_kp, matches):
-        vis = cv2.drawMatches(
-            tmpl_bgr, tmpl_kp,
-            frame_bgr, frame_kp if frame_kp is not None else [],
-            matches, None,
-            flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
-        )
-        cv2.putText(vis, f"Good matches: {len(matches)} (need 40+ for Homography)",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 0), 2, cv2.LINE_AA)
-        return vis
 
     def closeEvent(self, event):
         try:
