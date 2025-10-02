@@ -26,7 +26,7 @@ class My_App(QtWidgets.QMainWindow):
     """
 
     MIN_GOOD_MATCHES = 40
-    RATIO_TEST = 0.60                 # stricter ratio per request
+    RATIO_TEST = 0.70                 # stricter ratio per request
     RANSAC_REPROJ_THRESH = 5.0
 
     MATCH_W, MATCH_H = 900, 420       # popup canvas size (scaled to fit)
