@@ -12,14 +12,21 @@ import sys
 class My_App(QtWidgets.QMainWindow):
     """
     SIFT + BFMatcher + Homography (RANSAC).
-    - Main UI shows a clean live camera view (no overlays).
-    - Popup shows the side-by-side matches visualization with lines.
-      If >= MIN_GOOD_MATCHES, a blue homography polygon is drawn on the
-      *right (live) side* inside the popup image.
+
+    Behavior:
+      - Main UI shows a clean live camera view.
+      - Once a homography is successfully found (>= MIN_GOOD_MATCHES and H != None),
+        the main UI draws ONLY the blue homography polygon on top of the live frame.
+      - The popup always shows the side-by-side matches with lines; if homography is
+        available, the polygon is drawn on the live (right) side in the popup too.
+
+    Tuning:
+      - Lowe's ratio is set to 0.60 (stricter).
+      - Homography requires at least 40 "good" matches.
     """
 
     MIN_GOOD_MATCHES = 40
-    RATIO_TEST = 0.60                 # <- stricter ratio per request
+    RATIO_TEST = 0.60                 # stricter ratio per request
     RANSAC_REPROJ_THRESH = 5.0
 
     MATCH_W, MATCH_H = 900, 420       # popup canvas size (scaled to fit)
@@ -149,7 +156,10 @@ class My_App(QtWidgets.QMainWindow):
         else:
             QtWidgets.QMessageBox.information(self, "Template", "Template loaded and features computed.")
             # Clear popup canvas
-            blank = np.zeros((self.CAM_H, self.CAM_W + (self.template_img_color.shape[1] if self.template_img_color is not None else self.CAM_W), 3), dtype=np.uint8)
+            blank = np.zeros(
+                (self.CAM_H, self.CAM_W + (self.template_img_color.shape[1] if self.template_img_color is not None else self.CAM_W), 3),
+                dtype=np.uint8
+            )
             self._update_match_popup(blank, 0)
 
     def SLOT_query_camera(self):
@@ -157,57 +167,75 @@ class My_App(QtWidgets.QMainWindow):
         if not ok:
             return
 
-        # --- MAIN UI: show clean live feed (no lines / no boxes) ---
-        self.live_image_label.setPixmap(self.convert_cv_to_pixmap(frame))
+        # By default, main UI shows clean frame
+        main_display = frame.copy()
 
         # --- POPUP: compute matches and draw only there ---
-        if not self._is_template_loaded:
-            return
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        kp_frame, desc_frame = self.sift.detectAndCompute(gray, None)
-
-        good_matches = []
         vis_bgr = None
+        good_matches = []
+        homography_found = False
+        proj_polygon = None  # to draw on main UI only if found
 
-        if desc_frame is not None and len(desc_frame) > 0:
-            raw_matches = self.bf.knnMatch(self.template_desc, desc_frame, k=2)
+        if self._is_template_loaded:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            kp_frame, desc_frame = self.sift.detectAndCompute(gray, None)
 
-            # Lowe ratio test at 0.60
-            for m, n in raw_matches:
-                if m.distance < self.RATIO_TEST * n.distance:
-                    good_matches.append(m)
+            if desc_frame is not None and len(desc_frame) > 0:
+                raw_matches = self.bf.knnMatch(self.template_desc, desc_frame, k=2)
 
-            # Optionally draw homography on a copy of the live frame BEFORE drawMatches
-            overlay_frame = frame.copy()
-            if len(good_matches) >= self.MIN_GOOD_MATCHES:
-                src_pts = np.float32([self.template_kp[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                dst_pts = np.float32([kp_frame[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, self.RANSAC_REPROJ_THRESH)
-                if H is not None:
-                    h, w = self.template_img_gray.shape
-                    corners = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
-                    proj = cv2.perspectiveTransform(corners, H)
-                    cv2.polylines(overlay_frame, [np.int32(proj)], True, (255, 0, 0), 3, cv2.LINE_AA)
+                # Lowe ratio test @ 0.60
+                for m, n in raw_matches:
+                    if m.distance < self.RATIO_TEST * n.distance:
+                        good_matches.append(m)
 
-            # Build the side-by-side visualization WITH lines (and polygon if added)
-            vis_bgr = cv2.drawMatches(
-                self.template_img_color, self.template_kp,
-                overlay_frame, kp_frame if kp_frame is not None else [],
-                good_matches, None,
-                flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
-            )
+                # Prepare an overlay copy of the live frame for the POPUP only
+                overlay_frame = frame.copy()
 
-            # Add a small caption at the top of the composite
-            cv2.putText(vis_bgr, f"Good matches: {len(good_matches)} (need 40+ for Homography)",
-                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 0), 2, cv2.LINE_AA)
+                # Try homography if enough matches
+                if len(good_matches) >= self.MIN_GOOD_MATCHES:
+                    src_pts = np.float32([self.template_kp[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                    dst_pts = np.float32([kp_frame[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                    H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, self.RANSAC_REPROJ_THRESH)
+                    if H is not None:
+                        h, w = self.template_img_gray.shape
+                        corners = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
+                        proj = cv2.perspectiveTransform(corners, H)
 
-        # Push visualization to popup (or clear if none)
+                        # Draw polygon on the POPUP image (right side)
+                        cv2.polylines(overlay_frame, [np.int32(proj)], True, (255, 0, 0), 3, cv2.LINE_AA)
+
+                        # Save for MAIN UI draw (only polygon)
+                        homography_found = True
+                        proj_polygon = np.int32(proj)
+
+                # Build the side-by-side matches WITH lines (and polygon if drawn above)
+                vis_bgr = cv2.drawMatches(
+                    self.template_img_color, self.template_kp,
+                    overlay_frame, kp_frame if kp_frame is not None else [],
+                    good_matches, None,
+                    flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+                )
+                cv2.putText(
+                    vis_bgr,
+                    f"Good matches: {len(good_matches)} (need 40+ for Homography)",
+                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 0), 2, cv2.LINE_AA
+                )
+
+        # Update popup (even if no descriptors found)
         if vis_bgr is None:
-            blank = np.zeros((self.CAM_H, self.CAM_W + (self.template_img_color.shape[1] if self.template_img_color is not None else self.CAM_W), 3), dtype=np.uint8)
+            blank = np.zeros(
+                (self.CAM_H, self.CAM_W + (self.template_img_color.shape[1] if self.template_img_color is not None else self.CAM_W), 3),
+                dtype=np.uint8
+            )
             self._update_match_popup(blank, 0)
         else:
             self._update_match_popup(vis_bgr, len(good_matches))
+
+        # --- MAIN UI: draw ONLY the polygon if homography was found; else keep clean ---
+        if homography_found and proj_polygon is not None:
+            cv2.polylines(main_display, [proj_polygon], True, (255, 0, 0), 3, cv2.LINE_AA)
+
+        self.live_image_label.setPixmap(self.convert_cv_to_pixmap(main_display))
 
     def SLOT_toggle_camera(self):
         if self._is_cam_enabled:
